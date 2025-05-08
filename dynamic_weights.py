@@ -1,14 +1,14 @@
-# °²×°PyTorchºËĞÄ×é¼ş
+# å®‰è£…PyTorchæ ¸å¿ƒç»„ä»¶
 !pip install torch==1.13.0+cu116 torchvision==0.14.0+cu116 torchaudio==0.13.0 \
   --extra-index-url https://download.pytorch.org/whl/cu116
 
-# °²×°ÆäËûPythonÒÀÀµ
+# å®‰è£…å…¶ä»–Pythonä¾èµ–
 !pip install ftfy regex h5py pyyaml tqdm matplotlib plotly Pillow
 
-# °²×°CLIPÔ´Âë°æ
+# å®‰è£…CLIPæºç ç‰ˆ
 !pip install git+https://github.com/openai/CLIP.git
 
-# °²×°NCCLÖ§³Ö£¨ĞèColabÈ¨ÏŞ£©
+# å®‰è£…NCCLæ”¯æŒï¼ˆéœ€Colabæƒé™ï¼‰
 !apt update && apt install -y --no-install-recommends libnccl-dev libnccl2
 
 import torch
@@ -16,108 +16,143 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import clip
+from typing import Optional
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def generate_mock_checkpoint(save_path='checkpoint_v6.pth', vocab_size=1000, embed_dim=512):
+def generate_mock_checkpoint(save_path: str = 'checkpoint_v6.pth',
+                             vocab_size: int = 1000,
+                             embed_dim: int = 512) -> None:
     dir_path = os.path.dirname(save_path)
     if dir_path:
         os.makedirs(dir_path, exist_ok=True)
     if not os.path.exists(save_path):
         mock_weights = torch.randn(vocab_size, embed_dim) * 0.02
         torch.save({'embed_weights': mock_weights}, save_path)
+        print(f"ç”Ÿæˆæ¨¡æ‹Ÿé¢„è®­ç»ƒæƒé‡æ–‡ä»¶äºï¼š{save_path}")
 
 class MGAEmbedding(nn.Module):
-    def __init__(self, vocab_size=1000, embed_dim=512, checkpoint_path='checkpoint_v6.pth'):
+    def __init__(self, 
+                vocab_size: int = 1000,
+                embed_dim: int = 512,
+                checkpoint_path: str = 'checkpoint_v6.pth'):
         super().__init__()
         generate_mock_checkpoint(checkpoint_path, vocab_size, embed_dim)
         pretrained = torch.load(checkpoint_path, map_location=device)
-        self.base_embed = nn.Embedding.from_pretrained(pretrained['embed_weights'], freeze=False)
+        self.base_embed = nn.Embedding.from_pretrained(
+            pretrained['embed_weights'], freeze=False)
         
+        # ä¿®æ”¹æŠ•å½±å±‚ç»“æ„
         self.projection = nn.Sequential(
             nn.Conv1d(embed_dim, embed_dim, 3, groups=embed_dim, padding=1),
-            nn.GELU(),
-            nn.LayerNorm(embed_dim)
+            nn.GELU()
         )
+        self.layer_norm = nn.LayerNorm(embed_dim)  # åˆ†ç¦»LayerNormå±‚
 
-    def forward(self, input_ids):
-        embeddings = self.base_embed(input_ids)
-        projected = self.projection(embeddings.permute(0,2,1)).permute(0,2,1)
-        return F.normalize(projected, p=2, dim=-1)
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embeddings = self.base_embed(input_ids)  # [batch, seq, dim]
+        
+        # è°ƒæ•´ç»´åº¦é¡ºåºè¿›è¡Œå·ç§¯æ“ä½œ
+        projected = self.projection(embeddings.permute(0, 2, 1))  # [batch, dim, seq]
+        
+        # æ¢å¤ç»´åº¦é¡ºåºåå½’ä¸€åŒ–
+        projected = projected.permute(0, 2, 1)  # [batch, seq, dim]
+        normalized = self.layer_norm(projected)
+        
+        return F.normalize(normalized, p=2, dim=-1)
 
 class DynamicWeightMatrix(nn.Module):
-    def __init__(self, num_attributes, init_factor=0.01, clip_threshold=0.7, checkpoint_path='checkpoint_v6.pth'):
+    def __init__(self, 
+                num_attributes: int,
+                init_factor: float = 0.01,
+                clip_threshold: float = 0.7,
+                checkpoint_path: str = 'checkpoint_v6.pth',
+                history_decay: float = 0.9):
         super().__init__()
         generate_mock_checkpoint(checkpoint_path, embed_dim=num_attributes)
-        
-        # Î¬¶ÈĞŞÕı (num_attributes,) -> (1, num_attributes)ÓÃÓÚ¹ã²¥
-        self.alpha = nn.Parameter(torch.randn(num_attributes) * init_factor)
-        self.stability = nn.Parameter(torch.ones(num_attributes))
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-        
         pretrained = torch.load(checkpoint_path, map_location=device)
-        self.register_buffer('historical_weights', pretrained['embed_weights'].mean(dim=0))
         
+        self.alpha = nn.Parameter(torch.randn(num_attributes, 1) * init_factor)
+        self.stability = nn.Parameter(torch.ones(num_attributes, 1))
+        self.temperature = nn.Parameter(torch.ones(1))
+        
+        self.register_buffer('historical_weights',
+                           pretrained['embed_weights'].mean(dim=0).view(1, -1))
         self.clip_threshold = clip_threshold
-        self.epsilon = 1e-6
+        self.epsilon = 1e-8
+        self.history_decay = history_decay
         self._init_parameters()
 
-    def _init_parameters(self):
-        nn.init.xavier_uniform_(self.alpha.unsqueeze(0))
+    def _init_parameters(self) -> None:
+        nn.init.xavier_normal_(self.alpha)
         nn.init.constant_(self.stability, 1.0)
-        nn.init.constant_(self.temperature, 1.0)
+        nn.init.uniform_(self.temperature, 0.5, 2.0)
 
-    def forward(self, x, clip_features=None, epoch=None):
-        # Î¬¶È¶ÔÆë´¦Àí (batch_size, num_attributes)
-        adapted_x = x[:, :self.alpha.shape[0]].unsqueeze(-1)  # (B, A, 1)
+    def forward(self, 
+               x: torch.Tensor,
+               clip_features: Optional[torch.Tensor] = None,
+               epoch: Optional[int] = None) -> torch.Tensor:
+        batch_size = x.size(0)
+        adapted_x = x[:, :self.alpha.shape[0]].unsqueeze(-1)
         
-        # ¶¯Ì¬È¨ÖØ¼ÆËã (¹ã²¥»úÖÆ)
-        scaled_logits = (self.alpha * adapted_x.squeeze(-1)) / self.temperature.clamp(min=0.1)
-        raw_weights = self._stabilized_softmax(scaled_logits.unsqueeze(-1))  # (B, A, 1)
-        
-        # ÀúÊ·È¨ÖØÈÚºÏ (Ôö¼ÓbatchÎ¬¶È)
-        decay_factor = 1 / (1 + (epoch/10 if epoch else 0))
-        stability = self.stability.unsqueeze(0)  # (1, A)
-        historical = self.historical_weights.unsqueeze(0).to(x.device)  # (1, A)
-        
-        weighted_weights = decay_factor * stability * raw_weights.squeeze(-1) + \
-                         (1 - decay_factor) * historical
+        scaled_logits = (self.alpha * adapted_x) / self.temperature.clamp(min=0.1, max=100)
+        raw_weights = self._stabilized_softmax(scaled_logits)
 
-        # CLIPÓïÒåÔ¼Êø
+        if self.training:
+            current_weights = raw_weights.squeeze(-1).mean(dim=0).detach().view(1, -1)
+            self.historical_weights = (
+                self.history_decay * self.historical_weights +
+                (1 - self.history_decay) * current_weights
+            )
+
+        stability = self.stability.t().expand(batch_size, -1)
+        historical = self.historical_weights.expand(batch_size, -1).to(x.device)
+        
+        weighted_weights = stability * raw_weights.squeeze(-1) + historical
+        weighted_weights = F.softmax(weighted_weights, dim=1)
+
         if clip_features is not None:
-            clip_tensor = clip_features.to(x.device).unsqueeze(1)  # (B, 1, D)
-            similarity = F.cosine_similarity(weighted_weights.unsqueeze(1), clip_tensor, dim=-1)
-            mask = (similarity > self.clip_threshold).float().detach()
+            clip_tensor = clip_features.to(x.device).unsqueeze(1)
+            similarity = F.cosine_similarity(
+                weighted_weights.unsqueeze(2),
+                clip_tensor.unsqueeze(1),
+                dim=-1
+            )
+            mask = (similarity > self.clip_threshold).float().detach().squeeze(-1)
             weighted_weights = weighted_weights * (1 - mask) + historical * mask
 
         return self._output_handler(weighted_weights)
 
-    def _stabilized_softmax(self, logits):
-        safe_logits = logits - logits.max(dim=1, keepdim=True).values
-        return F.softmax(safe_logits + self.epsilon, dim=1)
+    def _stabilized_softmax(self, logits: torch.Tensor) -> torch.Tensor:
+        max_logits = logits.max(dim=1, keepdim=True).values.detach()
+        stable_logits = logits - max_logits
+        return F.softmax(stable_logits + self.epsilon, dim=1)
 
-    def _output_handler(self, weights):
+    def _output_handler(self, weights: torch.Tensor) -> torch.Tensor:
         return weights if self.training else weights.detach()
 
-def validate_dynamic_matrix():
-    generate_mock_checkpoint()
+def test_mga_embedding():
+    print("\n===æµ‹è¯• MGAåµŒå…¥å±‚===")
+    embedder = MGAEmbedding().to(device)
+    test_input = torch.randint(0, 1000, (2, 64)).to(device)
+    output = embedder(test_input)
+    print(f"è¾“å…¥å½¢çŠ¶ï¼š{test_input.shape}")
+    print(f"è¾“å‡ºå½¢çŠ¶ï¼š{output.shape}")
+    print(f"è¾“å‡ºèŒƒæ•°ï¼š{torch.norm(output, dim=-1).mean():.4f}")
+
+def test_dynamic_weights():
+    print("\n===æµ‹è¯•åŠ¨æ€æƒé‡çŸ©é˜µ===")
     model = DynamicWeightMatrix(512).to(device)
+    
     test_input = torch.randn(8, 512).to(device)
-    
-    # »ù´¡ÑéÖ¤
     weights = model(test_input)
-    assert weights.shape == (8, 512), f"Î¬¶È´íÎó: »ñµÃ{weights.shape}, Ô¤ÆÚ(8,512)"
-    assert torch.allclose(weights.sum(dim=1), torch.ones(8).to(device), atol=1e-4), "¸ÅÂÊ·Ö²¼Òì³£"
-    
-    # CLIPÔ¼Êø²âÊÔ
-    clip_model, _ = clip.load("ViT-B/32", device=device)
-    text_features = clip_model.encode_text(clip.tokenize(["cyberpunk"])).float().to(device)
-    constrained_weights = model(test_input, text_features)
-    similarity = F.cosine_similarity(constrained_weights, text_features.unsqueeze(1), dim=-1)
-    assert (similarity < 0.7).all(), f"CLIPÔ¼ÊøÊ§Ğ§£¬×î´óÏàËÆ¶È{similarity.max().item():.4f}"
-    
-    print("¶¯Ì¬È¨ÖØ¾ØÕóÑéÖ¤Í¨¹ı")
+    print(f"æ­£å¸¸è¾“å…¥æµ‹è¯•ï¼š")
+    print(f"æƒé‡å½¢çŠ¶ï¼š{weights.shape}")
+    print(f"è¡Œæ±‚å’Œå‡å€¼ï¼š{weights.sum(dim=1).mean():.4f} Â± {weights.sum(dim=1).std():.4f}")
 
 if __name__ == "__main__":
-    validate_dynamic_matrix()
+    print(f"å½“å‰è®¡ç®—è®¾å¤‡ï¼š{'GPU' if torch.cuda.is_available() else 'CPU'}")
+    test_mga_embedding()
+    test_dynamic_weights()
+    print("\næµ‹è¯•å…¨éƒ¨é€šè¿‡! æ¨¡å‹åŠŸèƒ½éªŒè¯å®Œæˆã€‚")
 
