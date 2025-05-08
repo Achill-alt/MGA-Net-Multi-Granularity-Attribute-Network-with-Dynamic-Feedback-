@@ -4,3 +4,5 @@
 embedding_layer.py是MGA属性嵌入层实现（PyTorch自定义层）
 
 dynamic_weights.py是动态权重分配模块（Softmax概率映射）
+
+history_feedback.py是历史权重反馈机制（集成MGA模块）
